@@ -308,20 +308,13 @@ def ownerrez_webhook():
 
     event_type = payload.get("type", "")
 
-     # Log everything including raw payload so we can see OwnerRez's format
-    log_event({
-        "type": "webhook_received", 
-        "event": event_type,
-        "raw_payload": json.dumps(payload)[:500]
-    })
-    
-   # Always log raw webhook including full payload for debugging
+     # Log raw webhook payload for debugging
     log_event({
         "type": "webhook_received",
         "event": event_type,
-        "guest": str(payload)[:80],
-        "property": "",
-        "message": json.dumps(payload)[:150]
+        "guest": "RAW:",
+        "property": json.dumps(payload)[:100],
+        "message": json.dumps(payload)[100:250]
     })
 
     if event_type != "message.created":
