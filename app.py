@@ -315,8 +315,14 @@ def ownerrez_webhook():
         "raw_payload": json.dumps(payload)[:500]
     })
     
-    # Always log raw webhook
-    log_event({"type": "webhook_received", "event": event_type})
+   # Always log raw webhook including full payload for debugging
+    log_event({
+        "type": "webhook_received",
+        "event": event_type,
+        "guest": str(payload)[:80],
+        "property": "",
+        "message": json.dumps(payload)[:150]
+    })
 
     if event_type != "message.created":
         return jsonify({"status": "ignored", "reason": "not a message event"}), 200
