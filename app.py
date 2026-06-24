@@ -16,6 +16,7 @@ OWNERREZ_CLIENT_ID = os.environ.get("OWNERREZ_CLIENT_ID", "")
 NIGHT_SHIFT_START = 22
 NIGHT_SHIFT_END = 8
 AI_MODE = os.environ.get("AI_MODE", "off")
+TRAINING_MODE = os.environ.get("TRAINING_MODE", "false").lower() == "true"
 AGENT_NAME = "Riley"
 
 # ─────────────────────────────────────────────
@@ -276,14 +277,17 @@ def dashboard():
     <div class="status-bar">
         <div class="status-chip">{mode_labels.get(AI_MODE, AI_MODE).upper()}</div>
         <div class="stat">Night shift: <span>{'ACTIVE' if is_night_shift() else 'INACTIVE'}</span></div>
+        <div class="stat">Training mode: <span>{'ON — evaluating 24/7' if TRAINING_MODE else 'OFF — night shift only'}</span></div>
         <div class="stat">Current time: <span>{datetime.now().strftime('%I:%M %p')}</span></div>
         <div class="stat">Events logged: <span>{len(recent_events)}</span></div>
         <div class="stat" style="margin-left:auto;font-size:11px;color:#aaa;">Auto-refreshes every 30s · <a href="/debug/raw?pretty=1">raw payloads</a></div>
     </div>
     <div class="container">
         <div class="instructions">
-            <strong>Change Riley's mode:</strong> Railway → project → Variables → <code>AI_MODE</code> =
-            <strong>off</strong> (log only) | <strong>draft</strong> (evaluate, don't send) | <strong>live</strong> (fully active)
+            <strong>Riley never sends messages in draft mode — period.</strong> Draft mode only evaluates and logs.
+            <br><strong>Change Riley's mode:</strong> Railway → project → Variables → <code>AI_MODE</code> =
+            <strong>off</strong> (log only) | <strong>draft</strong> (evaluate, never send) | <strong>live</strong> (sends urgent replies, night hours only)
+            <br><strong>Training mode:</strong> <code>TRAINING_MODE</code> = <strong>true</strong> makes Riley evaluate all day for practice | <strong>false</strong> restricts evaluation to 10pm–8am only
         </div>
         <br>
         <div class="card">
@@ -362,14 +366,7 @@ def ownerrez_webhook():
     guest_name = contact.get("first_name", "") if contact else ""
     property_name = entity.get("property_name", "")
 
-    log_event({
-        "type": "message_received",
-        "guest": guest_name or "Guest",
-        "property": property_name or "—",
-        "message": message_body
-    })
-
-    # MODE: OFF
+    # MODE: OFF — log only, no AI evaluation at all
     if AI_MODE == "off":
         log_event({
             "type": "message_received", "action": "logged_only",
@@ -378,12 +375,13 @@ def ownerrez_webhook():
         })
         return jsonify({"status": "logged", "mode": "off"}), 200
 
-    # Not night shift
-    if not is_night_shift():
+    # Skip evaluation outside night hours UNLESS training mode is on.
+    # This only controls whether Riley evaluates/drafts — never whether she sends.
+    if not is_night_shift() and not TRAINING_MODE:
         log_event({
             "type": "message_received", "action": "logged_only",
             "guest": guest_name or "Guest", "property": property_name or "—",
-            "message": message_body, "reasoning": "Not night shift hours"
+            "message": message_body, "reasoning": "Not night shift hours (training mode off)"
         })
         return jsonify({"status": "skipped", "reason": "not night shift"}), 200
 
@@ -399,6 +397,8 @@ def ownerrez_webhook():
     reasoning = result.get("reasoning", "")
     response_text = result.get("response")
 
+    # MODE: DRAFT — Riley evaluates and logs her decision, but NEVER sends anything.
+    # This is the only mode active right now. No send_reply() call exists in this branch.
     if AI_MODE == "draft":
         log_event({
             "type": "message_evaluated", "action": "draft_only",
@@ -408,8 +408,18 @@ def ownerrez_webhook():
         })
         return jsonify({"status": "draft", "urgency": urgency, "would_send": response_text}), 200
 
-    # LIVE mode
-    if urgency == "urgent" and response_text and thread_id:
+    # MODE: LIVE — only reachable if AI_MODE is explicitly set to "live" in Railway.
+    # Even then, only sends during real night shift hours.
+    if AI_MODE == "live" and not is_night_shift():
+        log_event({
+            "type": "message_evaluated", "action": "draft_only",
+            "guest": guest_name or "Guest", "property": property_name or "—",
+            "message": message_body, "urgency": urgency, "reasoning": reasoning + " (daytime — logged only, not sent)",
+            "draft_response": response_text
+        })
+        return jsonify({"status": "draft_daytime", "urgency": urgency, "would_send": response_text}), 200
+
+    if AI_MODE == "live" and urgency == "urgent" and response_text and thread_id:
         sent = send_reply(thread_id, response_text)
         log_event({
             "type": "message_responded", "action": "sent" if sent else "send_failed",
