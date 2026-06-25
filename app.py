@@ -269,6 +269,62 @@ def debug_sop():
     content = get_all_sop_content(force_refresh=True)
     return Response(content or "No content loaded — check GOOGLE_SERVICE_ACCOUNT_JSON and SOP_FOLDER_ID", mimetype="text/plain")
 
+@app.route("/debug/drive", methods=["GET"])
+def debug_drive():
+    import os, json
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    results = []
+    json_var = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    folder_id = os.environ.get("SOP_FOLDER_ID", "")
+
+    results.append(f"JSON env var present: {bool(json_var)}")
+    results.append(f"JSON env var length: {len(json_var)}")
+    results.append(f"Folder ID present: {bool(folder_id)}")
+    results.append(f"Folder ID value: {folder_id}")
+
+    if not json_var:
+        return Response("\n".join(results), mimetype="text/plain")
+
+    try:
+        info = json.loads(json_var)
+        results.append(f"JSON parsed OK. client_email: {info.get('client_email')}")
+        results.append(f"JSON project_id: {info.get('project_id')}")
+    except Exception as e:
+        results.append(f"JSON PARSE FAILED: {repr(e)}")
+        return Response("\n".join(results), mimetype="text/plain")
+
+    try:
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=['https://www.googleapis.com/auth/drive.readonly']
+        )
+        results.append("Credentials created OK")
+    except Exception as e:
+        results.append(f"CREDENTIALS FAILED: {repr(e)}")
+        return Response("\n".join(results), mimetype="text/plain")
+
+    try:
+        service = build('drive', 'v3', credentials=creds)
+        results.append("Drive service built OK")
+    except Exception as e:
+        results.append(f"BUILD SERVICE FAILED: {repr(e)}")
+        return Response("\n".join(results), mimetype="text/plain")
+
+    try:
+        r = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType)"
+        ).execute()
+        files = r.get('files', [])
+        results.append(f"API CALL SUCCESS. Files found: {len(files)}")
+        for f in files:
+            results.append(f"  - {f.get('name')} ({f.get('mimeType')})")
+    except Exception as e:
+        results.append(f"API CALL FAILED: {repr(e)}")
+
+    return Response("\n".join(results), mimetype="text/plain")
+
 @app.route("/debug/raw", methods=["GET"])
 def debug_raw():
     pretty = request.args.get("pretty")
