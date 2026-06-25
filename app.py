@@ -3,12 +3,10 @@ import json
 import os
 from datetime import datetime
 import anthropic
+from drive_helper import get_all_sop_content, list_sop_files
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────
-# CONFIGURATION
-# ─────────────────────────────────────────────
 OWNERREZ_WEBHOOK_PASSWORD = os.environ.get("OWNERREZ_WEBHOOK_PASSWORD", "nightshift2024")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 OWNERREZ_TOKEN = os.environ.get("OWNERREZ_TOKEN", "")
@@ -19,53 +17,24 @@ AI_MODE = os.environ.get("AI_MODE", "off")
 TRAINING_MODE = os.environ.get("TRAINING_MODE", "false").lower() == "true"
 AGENT_NAME = "Riley"
 
-# ─────────────────────────────────────────────
-# BRAIN
-# ─────────────────────────────────────────────
-BRAIN = f"""
+CORE_IDENTITY = f"""
 You are {AGENT_NAME}, a member of the Wishlist Vacations hospitality team in North Carolina.
-You manage guest communication overnight (10pm to 8am) across 34 lake and waterfront properties.
+You manage guest communication overnight across lake and waterfront properties.
 
 YOUR VOICE:
 - Warm and personal, like texting a friend
-- Use the guest's first name
+- Use the guest's first name when known
 - Short paragraphs, get to the point fast
-- Emoji okay when natural
+- Emoji okay when natural, not forced
 - Never say "per our policy" — sound like a real person
-- Sign off naturally as yourself when appropriate, not every message
-- Always leave the door open to help further
+- Never promise a refund, discount, or rate change — that's a team decision
+- Never make up information that isn't in the SOP content you were given
 
-URGENT — respond immediately:
-- Lockout / can't get in
-- Smoke or carbon monoxide alarm
-- Water leak or flooding
-- No heat (cold weather, under 45F outside)
-- No AC (extreme heat, over 90F outside)
-- Neighbor noise / party preventing sleep
-- Power outage affecting safety
-
-NOT URGENT — do not respond, leave for morning team:
-- Late checkout / early check-in requests
-- General questions with no time pressure
-- Positive feedback / thank yous
-- Anything that can reasonably wait until 8am
-- Pricing or discount negotiations
-- Multi-night extension requests
-- Group size / booking detail questions with no urgency
-
-WHAT YOU NEVER DO:
-- Promise a refund, discount, or rate change
-- Make up information you don't have
-- Respond to non-urgent messages at night
-- Send a message just to send one
-- Negotiate pricing or checkout times — always defer to morning team
-
-ESCALATION:
-If self-help steps don't resolve an urgent issue within 10 minutes,
-let the guest know a team member will reach out shortly.
-
-When in doubt — ask: would a reasonable guest be upset if this waited until 8am?
-If yes, respond. If no, leave it for the morning team.
+You will be given the current SOP content from the company's Google Drive knowledge base
+below. Base every decision and every word of your response on that content, not on
+general assumptions about vacation rentals. If the SOP content doesn't cover a
+situation, say so honestly in your reasoning and default to treating it as non-urgent
+unless safety is plausibly at risk.
 """
 
 recent_events = []
@@ -86,10 +55,6 @@ def save_raw_payload(payload):
 def is_night_shift():
     hour = datetime.now().hour
     return hour >= NIGHT_SHIFT_START or hour < NIGHT_SHIFT_END
-
-# ─────────────────────────────────────────────
-# OWNERREZ HELPERS
-# ─────────────────────────────────────────────
 
 def ownerrez_get(path, params=None):
     import requests
@@ -130,32 +95,23 @@ def ownerrez_post(path, body):
 def get_contact_info(contact_id):
     if not contact_id:
         return {}
-    data = ownerrez_get(f"/contacts/{contact_id}")
-    return data or {}
-
-def get_booking_info(booking_id):
-    if not booking_id:
-        return {}
-    data = ownerrez_get(f"/bookings/{booking_id}")
-    return data or {}
+    return ownerrez_get(f"/contacts/{contact_id}") or {}
 
 def get_thread_messages(thread_id):
     if not thread_id:
         return []
     data = ownerrez_get("/messages", {"thread_id": thread_id})
-    if data:
-        return data.get("items", [])
-    return []
+    return data.get("items", []) if data else []
 
 def send_reply(thread_id, message_body):
     return ownerrez_post("/messages", {"thread_id": thread_id, "body": message_body})
 
-# ─────────────────────────────────────────────
-# AI EVALUATION
-# ─────────────────────────────────────────────
-
 def evaluate_message(guest_message, guest_name, property_name, thread_history):
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    sop_content = get_all_sop_content()
+    if not sop_content:
+        sop_content = "(WARNING: No SOP content could be loaded from Google Drive. Treat this as a configuration error — default to non-urgent unless there is an obvious safety risk, and flag this in your reasoning.)"
 
     history_text = ""
     if thread_history:
@@ -165,7 +121,10 @@ def evaluate_message(guest_message, guest_name, property_name, thread_history):
             history_text += f"{role}: {msg.get('body', '')[:200]}\n"
 
     prompt = f"""
-{BRAIN}
+{CORE_IDENTITY}
+
+CURRENT SOP KNOWLEDGE BASE (live from Google Drive):
+{sop_content}
 
 CURRENT SITUATION:
 Guest name: {guest_name or "the guest"}
@@ -175,31 +134,28 @@ Property: {property_name or "unknown property"}
 NEW MESSAGE FROM GUEST:
 "{guest_message}"
 
-Evaluate this message and respond in JSON only with this exact format:
+Evaluate this message using the SOP content above and respond in JSON only:
 {{
   "urgency": "urgent" or "wait",
-  "reasoning": "one sentence explaining your decision",
-  "response": "your full message to the guest if urgent, or null if not urgent"
+  "reasoning": "one to two sentences explaining your decision, referencing the relevant SOP section if applicable",
+  "response": "your full message to the guest if urgent, or null if not urgent",
+  "escalate_to_team": true or false,
+  "escalation_summary": "if escalate_to_team is true, a one-sentence summary for the Slack escalation message, otherwise null"
 }}
 
-If urgent, write the response as Riley, a real Wishlist Vacations team member.
-If not urgent, set response to null.
-Return JSON only, no other text, no markdown formatting.
+Return JSON only, no markdown formatting, no other text.
 """
 
     response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1000,
+        max_tokens=1200,
+        temperature=0.3,
         messages=[{"role": "user", "content": prompt}]
     )
 
     raw = response.content[0].text.strip()
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
-
-# ─────────────────────────────────────────────
-# DASHBOARD
-# ─────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def dashboard():
@@ -210,6 +166,10 @@ def dashboard():
         "draft": "DRAFT — Riley evaluates and logs but never sends",
         "live": "LIVE — Riley is actively responding to urgent messages"
     }
+
+    sop_files = list_sop_files()
+    sop_status = f"{len(sop_files)} documents loaded" if sop_files else "No documents found — check Drive connection"
+    sop_names = ", ".join([f.get("name", "") for f in sop_files][:8]) if sop_files else "—"
 
     rows = ""
     for e in recent_events[:25]:
@@ -236,11 +196,11 @@ def dashboard():
             <td style="padding:10px;font-size:12px;color:#666;white-space:nowrap;">{e.get('timestamp','')}</td>
             <td style="padding:10px;font-size:13px;">{e.get('guest','—')}</td>
             <td style="padding:10px;font-size:13px;">{e.get('property','—')}</td>
-            <td style="padding:10px;font-size:13px;max-width:280px;">{(e.get('message','—') or '—')[:120]}</td>
+            <td style="padding:10px;font-size:13px;max-width:240px;">{(e.get('message','—') or '—')[:120]}</td>
             <td style="padding:10px;">{urgency_badge}</td>
             <td style="padding:10px;">{action_badge}</td>
             <td style="padding:10px;font-size:12px;color:#666;max-width:200px;">{e.get('reasoning','')}</td>
-            <td style="padding:10px;font-size:12px;color:#185FA5;max-width:250px;">{draft_resp[:150] if draft_resp else ''}</td>
+            <td style="padding:10px;font-size:12px;color:#185FA5;max-width:220px;">{draft_resp[:150] if draft_resp else ''}</td>
         </tr>
         """
 
@@ -267,27 +227,27 @@ def dashboard():
         table {{ width: 100%; border-collapse: collapse; }}
         th {{ text-align: left; padding: 10px; font-size: 12px; color: #999; border-bottom: 2px solid #eee; white-space: nowrap; }}
         .instructions {{ background: #E6F1FB; border-radius: 8px; padding: 16px 20px; font-size: 13px; color: #185FA5; line-height: 1.6; }}
+        .sop-status {{ background: #EAF3DE; border-radius: 8px; padding: 12px 20px; font-size: 12px; color: #3B6D11; margin-bottom: 16px; }}
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Wishlist Vacations — Riley</h1>
-        <p>Night Shift AI · wishlistnc.com · 34 lake properties · Active 10pm–8am</p>
+        <p>Night Shift AI · wishlistnc.com · Active 10pm–8am</p>
     </div>
     <div class="status-bar">
         <div class="status-chip">{mode_labels.get(AI_MODE, AI_MODE).upper()}</div>
         <div class="stat">Night shift: <span>{'ACTIVE' if is_night_shift() else 'INACTIVE'}</span></div>
         <div class="stat">Training mode: <span>{'ON — evaluating 24/7' if TRAINING_MODE else 'OFF — night shift only'}</span></div>
-        <div class="stat">Current time: <span>{datetime.now().strftime('%I:%M %p')}</span></div>
         <div class="stat">Events logged: <span>{len(recent_events)}</span></div>
-        <div class="stat" style="margin-left:auto;font-size:11px;color:#aaa;">Auto-refreshes every 30s · <a href="/debug/raw?pretty=1">raw payloads</a></div>
+        <div class="stat" style="margin-left:auto;font-size:11px;color:#aaa;">Auto-refreshes every 30s</div>
     </div>
     <div class="container">
+        <div class="sop-status">
+            <strong>Live SOP connection:</strong> {sop_status}{" — " + sop_names if sop_files else ""}
+        </div>
         <div class="instructions">
-            <strong>Riley never sends messages in draft mode — period.</strong> Draft mode only evaluates and logs.
-            <br><strong>Change Riley's mode:</strong> Railway → project → Variables → <code>AI_MODE</code> =
-            <strong>off</strong> (log only) | <strong>draft</strong> (evaluate, never send) | <strong>live</strong> (sends urgent replies, night hours only)
-            <br><strong>Training mode:</strong> <code>TRAINING_MODE</code> = <strong>true</strong> makes Riley evaluate all day for practice | <strong>false</strong> restricts evaluation to 10pm–8am only
+            <strong>Riley never sends in draft mode.</strong> SOP knowledge is pulled live from Google Drive on every message (cached 5 min) — update a doc in Drive and Riley reflects it on the next refresh, no redeploy needed.
         </div>
         <br>
         <div class="card">
@@ -304,6 +264,11 @@ def dashboard():
 </body>
 </html>"""
 
+@app.route("/debug/sop", methods=["GET"])
+def debug_sop():
+    content = get_all_sop_content(force_refresh=True)
+    return Response(content or "No content loaded — check GOOGLE_SERVICE_ACCOUNT_JSON and SOP_FOLDER_ID", mimetype="text/plain")
+
 @app.route("/debug/raw", methods=["GET"])
 def debug_raw():
     pretty = request.args.get("pretty")
@@ -313,10 +278,6 @@ def debug_raw():
             output += f"=== {item['timestamp']} ===\n{json.dumps(item['payload'], indent=2)}\n\n"
         return Response(output, mimetype="text/plain")
     return jsonify(raw_payloads)
-
-# ─────────────────────────────────────────────
-# WEBHOOK
-# ─────────────────────────────────────────────
 
 @app.route("/webhook/ownerrez", methods=["POST"])
 def ownerrez_webhook():
@@ -335,9 +296,7 @@ def ownerrez_webhook():
     if not isinstance(entity, dict):
         entity = {}
 
-    # Only process new message entities
     if action != "entity_create" or "body" not in entity:
-        log_event({"type": "webhook_received", "action": action, "guest": "—", "property": "—", "message": "—"})
         return jsonify({"status": "ignored", "reason": "not a new message"}), 200
 
     from_role = entity.get("from_role", "")
@@ -346,14 +305,10 @@ def ownerrez_webhook():
     from_contact_id = entity.get("from_contact_id")
     is_draft = entity.get("is_draft", False)
 
-    # Only process actual guest messages, not host/system/cotraveler messages
     if from_role not in ("guest",):
         log_event({
-            "type": "message_received",
-            "action": "logged_only",
-            "guest": f"(role: {from_role})",
-            "property": "—",
-            "message": message_body[:150],
+            "type": "message_received", "action": "logged_only",
+            "guest": f"(role: {from_role})", "property": "—", "message": message_body[:150],
             "reasoning": f"Skipped — from_role is '{from_role}', not 'guest'"
         })
         return jsonify({"status": "ignored", "reason": f"from_role={from_role}"}), 200
@@ -361,12 +316,10 @@ def ownerrez_webhook():
     if is_draft:
         return jsonify({"status": "ignored", "reason": "draft message"}), 200
 
-    # Get guest/contact info
     contact = get_contact_info(from_contact_id)
     guest_name = contact.get("first_name", "") if contact else ""
     property_name = entity.get("property_name", "")
 
-    # MODE: OFF — log only, no AI evaluation at all
     if AI_MODE == "off":
         log_event({
             "type": "message_received", "action": "logged_only",
@@ -375,8 +328,6 @@ def ownerrez_webhook():
         })
         return jsonify({"status": "logged", "mode": "off"}), 200
 
-    # Skip evaluation outside night hours UNLESS training mode is on.
-    # This only controls whether Riley evaluates/drafts — never whether she sends.
     if not is_night_shift() and not TRAINING_MODE:
         log_event({
             "type": "message_received", "action": "logged_only",
@@ -397,8 +348,6 @@ def ownerrez_webhook():
     reasoning = result.get("reasoning", "")
     response_text = result.get("response")
 
-    # MODE: DRAFT — Riley evaluates and logs her decision, but NEVER sends anything.
-    # This is the only mode active right now. No send_reply() call exists in this branch.
     if AI_MODE == "draft":
         log_event({
             "type": "message_evaluated", "action": "draft_only",
@@ -408,16 +357,15 @@ def ownerrez_webhook():
         })
         return jsonify({"status": "draft", "urgency": urgency, "would_send": response_text}), 200
 
-    # MODE: LIVE — only reachable if AI_MODE is explicitly set to "live" in Railway.
-    # Even then, only sends during real night shift hours.
     if AI_MODE == "live" and not is_night_shift():
         log_event({
             "type": "message_evaluated", "action": "draft_only",
             "guest": guest_name or "Guest", "property": property_name or "—",
-            "message": message_body, "urgency": urgency, "reasoning": reasoning + " (daytime — logged only, not sent)",
+            "message": message_body, "urgency": urgency,
+            "reasoning": reasoning + " (daytime — logged only, not sent)",
             "draft_response": response_text
         })
-        return jsonify({"status": "draft_daytime", "urgency": urgency, "would_send": response_text}), 200
+        return jsonify({"status": "draft_daytime", "urgency": urgency}), 200
 
     if AI_MODE == "live" and urgency == "urgent" and response_text and thread_id:
         sent = send_reply(thread_id, response_text)
